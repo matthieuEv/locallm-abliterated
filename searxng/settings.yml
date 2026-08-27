@@ -1,0 +1,21 @@
+use_default_settings: true
+
+general:
+  instance_name: "Local SearXNG"
+
+search:
+  safe_search: 0
+  default_lang: "fr-FR"
+  formats:
+    - html
+    - json
+
+ui:
+  default_locale: "fr-FR"
+
+server:
+  bind_address: "0.0.0.0"
+  port: 8080
+  secret_key: "local-secret-key"
+  limiter: false
+  image_proxy: true

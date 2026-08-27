@@ -1,0 +1,83 @@
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+
+    ports:
+      - "3000:8080"
+
+    volumes:
+      - open-webui-data:/app/backend/data
+      - ./system-prompt.txt:/app/backend/system-prompt.txt:ro
+
+    environment:
+      # Compose = source de vérité
+      ENABLE_PERSISTENT_CONFIG: "False"
+
+      # Pas d'auth
+      WEBUI_AUTH: "False"
+
+      # -----------------------------
+      # Rapid-MLX
+      # -----------------------------
+
+      OPENAI_API_BASE_URLS: "http://host.docker.internal:8000/v1;http://host.docker.internal:8001/v1"
+      OPENAI_API_KEYS: "local;local"
+
+      # Petit modèle pour les tâches secondaires
+      TASK_MODEL_EXTERNAL: "qwen3-4b-instruct-2507-4bit"
+
+      # -----------------------------
+      # Générations secondaires
+      # -----------------------------
+
+      ENABLE_TITLE_GENERATION: "True"
+      ENABLE_TAGS_GENERATION: "True"
+      ENABLE_FOLLOW_UP_GENERATION: "True"
+      ENABLE_AUTOCOMPLETE_GENERATION: "False"
+
+      # -----------------------------
+      # Compaction du contexte
+      # -----------------------------
+
+      ENABLE_CONTEXT_COMPACTION: "True"
+      CONTEXT_COMPACTION_MODEL: "qwen3-4b-instruct-2507-4bit"
+      CONTEXT_COMPACTION_TOKEN_THRESHOLD: "8000"
+      CONTEXT_COMPACTION_TOKEN_CAP: "8000"
+      CONTEXT_COMPACTION_RETENTION_PERCENTAGE: "30"
+
+      # -----------------------------
+      # Web
+      # -----------------------------
+
+      ENABLE_WEB_SEARCH: "True"
+      WEB_SEARCH_ENGINE: "searxng"
+      WEB_SEARCH_RESULT_COUNT: "3"
+      SEARXNG_QUERY_URL: "http://searxng:8080/search?q=<query>"
+
+      # Évite d'injecter énormément de contenu
+      BYPASS_WEB_SEARCH_WEB_LOADER: "True"
+      WEB_FETCH_MAX_CONTENT_LENGTH: "10000"
+
+      # Évite les boucles de 18 recherches...
+      CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS: "6"
+
+    depends_on:
+      - searxng
+
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+
+    ports:
+      - "8081:8080"
+
+    volumes:
+      - ./searxng:/etc/searxng:rw
+      - searxng-data:/var/cache/searxng:rw
+
+volumes:
+  open-webui-data:
+  searxng-data:
