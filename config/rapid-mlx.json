@@ -1,0 +1,14 @@
+{
+  "version": "0.16.6",
+  "model": "Youssofal/Qwen3.6-35B-A3B-Abliterated-Heretic-MLX-4bit",
+  "flags": [
+    "--host", "127.0.0.1", "--port", "8000", "--text-only",
+    "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder_xml", "--reasoning-parser", "qwen3",
+    "--enable-prefix-cache", "--cache-memory-mb", "4096", "--hybrid-cache-entries", "1",
+    "--kv-cache-dtype", "bf16", "--kv-cache-turboquant", "none",
+    "--prefill-step-size", "2048", "--max-num-seqs", "1", "--max-concurrent-requests", "4",
+    "--context-length", "32768", "--max-prompt-tokens", "28672", "--max-tokens", "4096",
+    "--gpu-memory-utilization", "0.70", "--no-thinking", "--no-spec-decode", "--pflash", "off",
+    "--response-cache-entries", "0", "--disable-model-downloads", "--log-file", "-"
+  ]
+}
