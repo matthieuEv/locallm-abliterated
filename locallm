@@ -1,23 +1,336 @@
-#!/bin/sh
-set -eu
-case "${1:-}" in
-  start|destroy) ;;
-  *) echo 'Usage: ./locallm start [project] [OpenCode flags...] | ./locallm destroy' >&2; exit 2 ;;
-esac
-repo=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-if ! command -v uv >/dev/null 2>&1; then
-  if [ -x "$HOME/.local/bin/uv" ]; then
-    PATH="$HOME/.local/bin:$PATH"
-    export PATH
-  else
-    installer=$(mktemp)
-    trap 'rm -f "$installer"' EXIT HUP INT TERM
-    curl -fsSL https://astral.sh/uv/install.sh -o "$installer"
-    UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$HOME/.local/bin" sh "$installer"
-    rm -f "$installer"
-    trap - EXIT HUP INT TERM
-    PATH="$HOME/.local/bin:$PATH"
-    export PATH
-  fi
-fi
-exec uv run --no-project --no-config --python 3.12 "$repo/setup.py" "$@"
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+MODEL='Youssofal/Qwen3.6-35B-A3B-Abliterated-Heretic-MLX-4bit'
+repo=$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+fail() { printf 'Erreur : %s\n' "$*" >&2; exit 1; }
+inside() { [[ "$1" == "$2" || "$1" == "$2/"* ]]; }
+resolve_path() {
+    local path=$1 depth=${2:-0} parent name link
+    [[ "$path" == /* && "$path" != *$'\n'* && "$path" != *$'\r'* ]] || fail "Chemin absolu requis : $path"
+    (( depth < 40 )) || fail "Trop de liens symboliques : $path"
+    if [[ -L "$path" ]]; then
+        link=$(readlink "$path")
+        [[ "$link" == /* ]] || link="$(dirname -- "$path")/$link"
+        resolve_path "$link" "$((depth + 1))"
+    elif [[ -e "$path" ]]; then
+        /bin/realpath "$path"
+    else
+        parent=$(resolve_path "$(dirname -- "$path")" "$((depth + 1))")
+        name=$(basename -- "$path")
+        case "$name" in
+            .) printf '%s\n' "$parent" ;;
+            ..) dirname -- "$parent" ;;
+            *) printf '%s/%s\n' "${parent%/}" "$name" ;;
+        esac
+    fi
+}
+check_target() {
+    local target=$1
+    if [[ "$target" == / ]] || inside "$home" "$target"; then fail "Chemin dangereux : $target"; fi
+    if inside "$repo" "$target" || inside "$target" "$repo"; then fail "Le repo doit rester intact : $target"; fi
+}
+safe_target() { local target; target=$(resolve_path "$1"); check_target "$target"; }
+safe_entry() {
+    local parent
+    parent=$(resolve_path "$(dirname -- "$1")")
+    check_target "${parent%/}/$(basename -- "$1")"
+}
+remove_path() {
+    safe_entry "$1"
+    if [[ -L "$1" ]]; then
+        rm -- "$1"
+    elif [[ -e "$1" ]]; then
+        safe_target "$1"
+        printf 'Suppression : %s\n' "$1"
+        rm -rf -- "$1"
+    fi
+}
+init_paths() {
+    home=$(resolve_path "$HOME")
+    config_root=${XDG_CONFIG_HOME:-$home/.config}
+    data_root=${XDG_DATA_HOME:-$home/.local/share}
+    state_root=${XDG_STATE_HOME:-$home/.local/state}
+    cache_root=${XDG_CACHE_HOME:-$home/.cache}
+    config=$config_root/opencode
+    state=$state_root/locallm-abliterated
+    tool_bin=${UV_TOOL_BIN_DIR:-$home/.local/bin}
+    opencode=$home/.opencode/bin/opencode
+    rapid=$tool_bin/rapid-mlx
+    hub=${HF_HUB_CACHE:-${HF_HOME:-$cache_root/huggingface}/hub}
+    model_path=$hub/models--${MODEL//\//--}
+    rapid_config=$repo/config/rapid-mlx.json
+    opencode_config=$repo/config/opencode.json
+    local path
+    for path in "$config_root" "$data_root" "$state_root" "$cache_root" "$tool_bin" "$hub"; do
+        [[ "$path" == /* ]] || fail "Chemin absolu requis : $path"
+    done
+    export RAPID_MLX_TELEMETRY=0 RAPID_MLX_DISABLE_VERSION_CHECK=1
+    export HF_HUB_DISABLE_TELEMETRY=1 DO_NOT_TRACK=1
+}
+fetch_json() { curl -fsSL --connect-timeout 10 --max-time 60 "$1"; }
+latest_v2() {
+    local data version
+    data=$(fetch_json 'https://opencode.ai/update/api/latest/cli/npm' 2>/dev/null) || data='{}'
+    version=$(jq -er '.version | select(type == "string" and test("^2\\.[0-9]+\\.[0-9]+$"))' <<< "$data" 2>/dev/null) || version=''
+    if [[ -n "$version" ]]; then printf '%s\n' "$version"; return; fi
+    data=$(fetch_json 'https://registry.npmjs.org/@opencode%2fcli') || fail 'Métadonnées npm indisponibles.'
+    jq -er '.versions | keys | map(select(test("^2\\.[0-9]+\\.[0-9]+$"))) | sort_by(split(".") | map(tonumber)) | last // error("Aucune version stable 2.x")' <<< "$data"
+}
+validate_config() {
+    jq -e --arg model "$MODEL" --slurpfile rapid "$rapid_config" '
+      def flag($name): .flags as $f | ($f | index($name)) as $i |
+        if $i == null then null else ($f[$i + 1] | tonumber) end;
+      .providers["rapid-mlx"].models[$model].limit as $l |
+      .model == ("rapid-mlx/" + $model) and
+      ([$l.context, $l.input, $l.output] | all(.[]; type == "number" and . > 0 and floor == .)) and
+      ($l.input + $l.output <= $l.context) and
+      ($rapid[0] | .model == $model and
+        (.flags | type == "array" and all(.[]; type == "string" and (contains("\n") | not))) and
+        flag("--context-length") == $l.context and
+        flag("--max-prompt-tokens") == $l.input and flag("--max-tokens") == $l.output)
+    ' "$opencode_config" >/dev/null || fail 'Modèle ou budgets OpenCode/Rapid-MLX incohérents.'
+}
+check_installations() {
+    local name expected directory candidate
+    for name in opencode rapid-mlx; do
+        if [[ "$name" == opencode ]]; then expected=$opencode; else expected=$rapid; fi
+        while IFS= read -r directory; do
+            candidate=${directory:-.}/$name
+            if [[ -f "$candidate" && -x "$candidate" ]]; then
+                [[ "$candidate" == /* ]] || candidate="$PWD/$candidate"
+                [[ "$(resolve_path "$candidate")" == "$(resolve_path "$expected")" ]] || fail "Installation concurrente : $candidate"
+            fi
+        done < <(printf '%s\n' "$PATH" | tr ':' '\n')
+    done
+}
+check_space() {
+    local info revision filename size needed=0 available
+    safe_target "$hub"
+    mkdir -p -- "$hub"
+    info=$(fetch_json "https://huggingface.co/api/models/$MODEL?blobs=true") || fail 'Métadonnées du modèle indisponibles.'
+    jq -e '.sha | type == "string" and test("^[a-f0-9]{40}$")' <<< "$info" >/dev/null || fail 'Révision Hugging Face invalide.'
+    jq -e '.siblings | type == "array" and all(.[];
+      (.rfilename | type == "string" and length > 0 and (test("[\r\n\t]") | not)) and
+      ((.size // 0) | type == "number" and . >= 0 and floor == .))' <<< "$info" >/dev/null || fail 'Liste des fichiers du modèle invalide.'
+    revision=$(jq -r .sha <<< "$info")
+    while IFS=$'\t' read -r filename size; do
+        [[ "$filename" != /* && "/$filename/" != *'/../'* ]] || fail 'Chemin de fichier du modèle invalide.'
+        [[ "$size" =~ ^[0-9]+$ ]] || fail 'Taille de fichier invalide.'
+        if [[ ! -f "$model_path/snapshots/$revision/$filename" ]]; then needed=$((needed + size)); fi
+    done < <(jq -r '.siblings[] | [.rfilename, (.size // 0)] | @tsv' <<< "$info")
+    available=$(df -Pk "$hub" | awk 'NR == 2 {print $4}')
+    [[ "$available" =~ ^[0-9]+$ ]] || fail 'Espace disque illisible.'
+    (( available * 1024 >= needed + 6 * 1024 * 1024 * 1024 )) || fail 'Espace insuffisant : téléchargement manquant + 6 Gio de réserve requis.'
+}
+copy_config() {
+    local destination temporary
+    safe_target "$config"; safe_target "$config_root/rapid-mlx"
+    mkdir -p -- "$config" "$config_root/rapid-mlx"
+    remove_path "$config/opencode.jsonc"
+    for destination in "$config/opencode.json" "$config/local-context.md" "$config_root/rapid-mlx/locallm.json"; do
+        safe_entry "$destination"
+        temporary=$(mktemp "$(dirname -- "$destination")/.locallm.XXXXXX")
+        case "$destination" in
+            */opencode.json) jq --arg file "$config/local-context.md" '.instructions = [$file]' "$opencode_config" > "$temporary" ;;
+            */local-context.md) cat "$repo/config/local-context.md" > "$temporary" ;;
+            *) cat "$rapid_config" > "$temporary" ;;
+        esac
+        # macOS mv -h replaces a destination symlink instead of following it.
+        /bin/mv -f -h -- "$temporary" "$destination"
+    done
+}
+identity() {
+    local snapshot status owner
+    snapshot=$(/bin/ps -p "$1" -o uid=,lstart=,stat= 2>/dev/null) || return 1
+    owner=$(awk '{print $1}' <<< "$snapshot"); status=$(awk '{print $NF}' <<< "$snapshot")
+    [[ "$owner" == "$UID" && "$status" != Z* ]] || return 1
+    sed -E 's/^[[:space:]]*//; s/[[:space:]]+[^[:space:]]+[[:space:]]*$//' <<< "$snapshot"
+}
+process_record() {
+    local birth
+    birth=$(identity "$1") || birth=''
+    jq -n --argjson pid "$1" --arg birth "$birth" '{pid: $pid, identity: $birth}'
+}
+stop_record() {
+    local info=$1 group=${2:-false} pid birth current pgid attempt
+    [[ "$info" != null && -n "$info" ]] || return 0
+    pid=$(jq -er '.pid | select(type == "number" and . > 1 and floor == .)' <<< "$info") || fail 'PID enregistré invalide.'
+    birth=$(jq -er '.identity | select(type == "string")' <<< "$info") || fail 'Identité enregistrée invalide.'
+    [[ -n "$birth" ]] || return 0
+    current=$(identity "$pid") || return 0
+    [[ "$current" == "$birth" ]] || return 0
+    if [[ "$group" == true ]]; then
+        pgid=$(/bin/ps -p "$pid" -o pgid= 2>/dev/null | tr -d '[:space:]') || return 0
+        [[ "$pgid" == "$pid" ]] || fail "Groupe de processus inattendu pour $pid."
+        kill -TERM -- "-$pid" 2>/dev/null || return 0
+    else
+        kill -TERM "$pid" 2>/dev/null || return 0
+    fi
+    for ((attempt=0; attempt<100; attempt++)); do
+        current=$(identity "$pid") || return 0
+        [[ "$current" == "$birth" ]] || return 0
+        sleep 0.1
+    done
+    if [[ "$group" == true ]]; then kill -KILL -- "-$pid" 2>/dev/null || :; else kill -KILL "$pid" 2>/dev/null || :; fi
+}
+save_run() {
+    [[ "$mode" == _start ]] || return 0
+    jq -n --argjson owner "$owner_info" --argjson rapid "$rapid_info" --argjson child "$child_info" --argjson ui "$ui_info" \
+        '{owner:$owner, rapid:$rapid, child:$child, ui:$ui}' > "$state/run.tmp"
+    /bin/mv -f -h -- "$state/run.tmp" "$state/run.json"
+}
+cleanup() {
+    local code=$? pid parent group info
+    trap - EXIT
+    trap '' INT TERM HUP
+    stop_record "$ui_info" || :
+    stop_record "$child_info" true || :
+    stop_record "$rapid_info" true || :
+    # A signal can arrive between spawning a child and recording its identity.
+    for pid in $(jobs -p); do
+        parent=$(/bin/ps -p "$pid" -o ppid= 2>/dev/null | tr -d '[:space:]') || continue
+        [[ "$parent" == "$$" ]] || continue
+        info=$(process_record "$pid")
+        group=$(/bin/ps -p "$pid" -o pgid= 2>/dev/null | tr -d '[:space:]') || continue
+        if [[ "$group" == "$pid" ]]; then stop_record "$info" true || :; else stop_record "$info" || :; fi
+    done
+    wait 2>/dev/null || :
+    if [[ "$mode" == _start && -f "$state/run.json" ]]; then rm -f -- "$state/run.json"; fi
+    [[ -z "$scratch" ]] || rm -rf -- "$scratch"
+    if [[ "$rapid_info" != null ]]; then printf 'Rapid-MLX arrêté. Installation conservée jusqu’à ./locallm destroy.\n'; fi
+    exit "$code"
+}
+run_child() {
+    local code=0 child_pid
+    "$@" </dev/null &
+    child_pid=$!; child_info=$(process_record "$child_pid"); save_run
+    wait "$child_pid" || code=$?
+    child_info=null; save_run
+    return "$code"
+}
+ensure_uv() {
+    if ! command -v uv >/dev/null 2>&1; then
+        if [[ ! -x "$home/.local/bin/uv" ]]; then
+            run_child curl -fsSL --connect-timeout 10 --max-time 60 'https://astral.sh/uv/install.sh' -o "$scratch/uv-install.sh"
+            run_child env UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$home/.local/bin" sh "$scratch/uv-install.sh"
+        fi
+        PATH="$home/.local/bin:$PATH"; export PATH
+    fi
+}
+wait_ready() {
+    local pid=$1 deadline=$((SECONDS + 600)) models
+    while (( SECONDS < deadline )); do
+        identity "$pid" >/dev/null || fail "Rapid-MLX a échoué. Voir $state/current/rapid-mlx.log"
+        if curl -fsS --connect-timeout 1 --max-time 2 http://127.0.0.1:8000/health/ready >/dev/null 2>&1; then
+            models=$(curl -fsS --connect-timeout 1 --max-time 2 http://127.0.0.1:8000/v1/models) || continue
+            jq -e --arg model "$MODEL" '.data | any(.[]; .id == $model)' <<< "$models" >/dev/null || fail 'Le serveur expose un autre modèle.'
+            return
+        fi
+        sleep 1
+    done
+    fail 'Rapid-MLX indisponible après 10 minutes ; consulter les logs.'
+}
+start_setup() {
+    local project=$1 version installed log_dir flag code=0 ui_pid rapid_pid
+    shift
+    [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || fail 'Rapid-MLX nécessite macOS Apple Silicon sans Rosetta.'
+    [[ -d "$project" ]] || fail "Ce n’est pas un dossier : $project"
+    project=$(CDPATH= cd -P -- "$project" && pwd)
+    validate_config; check_installations
+    if lsof -nP -iTCP:8000 -sTCP:LISTEN >/dev/null 2>&1; then fail 'Port 8000 occupé. Arrête le serveur existant avant start.'; fi
+    check_space; ensure_uv
+    if [[ -x "$opencode" ]]; then run_child "$opencode" service stop; fi
+    version=$(latest_v2) || fail 'Aucune version stable OpenCode 2.x disponible.'
+    printf 'Installation OpenCode stable %s\n' "$version"
+    run_child curl -fsSL --connect-timeout 10 --max-time 60 https://opencode.ai/v2/install -o "$scratch/opencode-install.sh"
+    run_child bash "$scratch/opencode-install.sh" --version "$version" --no-modify-path
+    installed=$("$opencode" --version); installed=${installed#opencode }; installed=${installed#v}
+    [[ "$installed" == "$version" ]] || fail "Version OpenCode inattendue : $installed"
+    run_child uv tool install --python 3.12 --upgrade --no-cache "rapid-mlx==$(jq -er .version "$rapid_config")"
+    # pull is non-interactive with stdin closed; its own download policy remains in force.
+    run_child "$rapid" pull "$MODEL"
+    copy_config
+    log_dir=$state/logs/$(date +%Y%m%d-%H%M%S)-$$
+    mkdir -p -- "$log_dir"
+    [[ ! -d "$state/current" || -L "$state/current" ]] || fail 'Le chemin current est un dossier inattendu.'
+    rm -f -- "$state/current"; ln -s "logs/$(basename -- "$log_dir")" "$state/current"
+    printf 'Logs : %s/current\nChargement du modèle…\n' "$state"
+    flags=()
+    while IFS= read -r flag; do flags+=("$flag"); done < <(jq -r '.flags[]' "$rapid_config")
+    "$rapid" serve "$MODEL" "${flags[@]}" --watchdog-ppid "$$" </dev/null > "$log_dir/rapid-mlx.log" 2>&1 &
+    rapid_pid=$!; rapid_info=$(process_record "$rapid_pid"); save_run
+    wait_ready "$rapid_pid"
+    printf 'Rapid-MLX prêt : http://127.0.0.1:8000/v1 — ouverture d’OpenCode.\n'
+    # Share the foreground terminal with the TUI; keep the server in its existing separate group.
+    set +m
+    (cd -- "$project" && exec "$opencode" --standalone --print-logs --log-level info "$project" "$@") <&0 2> "$log_dir/opencode.log" &
+    ui_pid=$!; ui_info=$(process_record "$ui_pid"); save_run
+    wait "$ui_pid" || code=$?
+    ui_info=null; save_run
+    return "$code"
+}
+destroy_paths() {
+    paths=("$home/.opencode" "$config" "$data_root/opencode" "$state_root/opencode" "$cache_root/opencode"
+        "${TMPDIR:-/tmp}/opencode" "$config_root/rapid-mlx" "$home/.rapid-mlx" "$cache_root/rapid-mlx"
+        "$state_root/rapid-mlx" "$tool_bin/start-rapid-mlx" "$tool_bin/bench-rapid-mlx"
+        "$model_path" "$hub/.locks/$(basename -- "$model_path")" "$state")
+    local path
+    for path in "${paths[@]}"; do
+        safe_entry "$path"
+        if [[ ! -L "$path" ]]; then safe_target "$path"; fi
+    done
+}
+stop_active() {
+    local info
+    [[ -f "$state/run.json" ]] || return 0
+    info=$(cat "$state/run.json")
+    jq -e '.owner.pid and .owner.identity' <<< "$info" >/dev/null || fail 'État de session invalide.'
+    stop_record "$(jq -c '.ui // null' <<< "$info")"
+    stop_record "$(jq -c '.child // null' <<< "$info")" true
+    stop_record "$(jq -c '.rapid // null' <<< "$info")" true
+    stop_record "$(jq -c .owner <<< "$info")"
+}
+destroy_setup() {
+    local tools path
+    destroy_paths; ensure_uv
+    if [[ -x "$opencode" ]]; then run_child "$opencode" service stop; fi
+    tools=$(uv tool list)
+    if grep -q '^rapid-mlx v' <<< "$tools"; then
+        if [[ -d "$model_path" && ! -L "$model_path" ]]; then
+            safe_target "$model_path"
+            run_child "$rapid" rm "$MODEL" --yes
+        fi
+        run_child uv tool uninstall rapid-mlx
+    fi
+    for path in "${paths[@]}"; do remove_path "$path"; done
+    printf 'Setup supprimé, y compris sessions et modèle. Repo conservé.\n'
+}
+main() {
+    mode=${1:-}; [[ $# == 0 ]] || shift
+    case "$mode" in start|destroy|_start|_destroy) ;; *) printf 'Usage: ./locallm start [project] [OpenCode flags...] | ./locallm destroy\n' >&2; exit 2 ;; esac
+    command -v jq >/dev/null 2>&1 || fail 'jq est requis (brew install jq).'
+    init_paths
+    if [[ "$mode" == start || "$mode" == destroy ]]; then
+        if [[ "$mode" == destroy ]]; then [[ $# == 0 ]] || fail 'destroy ne prend pas d’argument.'; destroy_paths; stop_active; fi
+        safe_target "$state"; mkdir -p -- "$state"; safe_target "$state/run.lock"
+        local timeout=0; [[ "$mode" != destroy ]] || timeout=15
+        exec /usr/bin/lockf -k -t "$timeout" "$state/run.lock" /bin/bash "$repo/locallm" "_$mode" "$@"
+    fi
+    set -m
+    child_info=null; rapid_info=null; ui_info=null; scratch=''
+    owner_info=$(process_record "$$")
+    jq -e '.identity | length > 0' <<< "$owner_info" >/dev/null || fail 'Lecture des identités de processus impossible ; aucun service lancé.'
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/locallm.XXXXXX")
+    save_run
+    if [[ "$mode" == _start ]]; then
+        local project=${1:-$PWD}; [[ $# == 0 ]] || shift
+        start_setup "$project" "$@"
+    else destroy_setup; fi
+}
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
