@@ -67,6 +67,8 @@ Si le service de métadonnées OpenCode est indisponible (notamment HTTP 403),
 préversions et les versions 3.x restent exclues. Le numéro de version n'est pas
 figé dans le repo : il est recherché à nouveau à chaque lancement.
 Rapid-MLX est fixé à **0.16.6**, version dont les options ont été vérifiées.
+Ses dépendances sont résolues à l'installation : ce numéro seul ne fige pas
+l'ensemble de l'environnement Python.
 Un téléchargement déjà présent dans le cache Hugging Face est réutilisé.
 
 Le port **127.0.0.1:8000** doit être libre. Le script refuse un port occupé et ne
@@ -304,12 +306,41 @@ Avant la migration Bash, les fichiers de configuration avaient également été
 chargés avec le vrai binaire OpenCode 2.1.2 dans un HOME et un service temporaires :
 le catalogue effectif exposait **49 152 / 40 960 / 8 192** et l'ancien plugin
 `local.rapid-compaction` restait désactivé. Les 25 options serveur, watchdog inclus,
-avaient été vérifiées dans l'aide du Rapid-MLX 0.16.6 installé. Ces vérifications
-ne constituent pas un test complet de la nouvelle orchestration Bash avec le modèle.
-Le cycle d'installation/mise à jour et de destruction de l'installation réelle
-n'est pas exécuté par les tests : il remplacerait la configuration ou supprimerait
-les sessions. Les contraintes de qualité des compactions restent celles décrites
-plus haut.
+avaient été vérifiées dans l'aide du Rapid-MLX 0.16.6 installé. Les tests isolés
+ci-dessus ne modifient jamais l'installation réelle.
+
+### Cycle réel vérifié le 23 octobre 2026
+
+Un cycle **`destroy → start → fermeture d'OpenCode → destroy`** a ensuite été
+exécuté sur le Mac M4 Pro 48 Gio, avec suppression de l'ancien setup et de ses
+sessions, puis réinstallation dans les emplacements utilisateur habituels :
+
+- Installation automatique d'**OpenCode 2.1.4 stable** et **Rapid-MLX 0.16.6**.
+- Nouveau téléchargement complet du modèle Youssofal : **22,9 Gio**, en **12 min
+  42 s** sur cette connexion. Cette durée concerne le téléchargement.
+- Copie des configurations, chargement du modèle en arrière-plan et ouverture du
+  vrai client OpenCode en terminal. `opencode debug config` confirme les budgets
+  **49 152 / 40 960 / 8 192**, les instructions et la compaction configurée ;
+  `/health/ready` et `/v1/models` confirment le modèle attendu.
+- Dans un projet temporaire neutre, l'agent a d'abord essayé un chemin incorrect,
+  puis retrouvé le fichier avec `glob`, réussi l'appel `read` et répondu
+  exactement `LOCAL_SETUP_OK`. Aucun fichier du projet utilisateur n'a été modifié.
+- Premier préremplissage de **8 819 tokens** : **11,9 s de TTFT** ; trois appels
+  suivants réutilisent le préfixe et donnent **0,5–0,6 s de TTFT**. Pic Metal
+  **26,41 Go**, entrée de prefix cache d'environ **423 Mio** en fin de test.
+  Ce court échange ne mesure pas le débit de décodage ni les compactions longues.
+- Quitter OpenCode arrête Rapid-MLX et rend le port 8000 disponible. `destroy`
+  supprime ensuite les installations, les configurations, la base des sessions et
+  le modèle, avec **22,9 Gio libérés**. Les chemins et PID enregistrés ont été
+  contrôlés après suppression ; repo, projets et autre outil uv sont conservés.
+  Un second `destroy` sur l'installation déjà supprimée réussit aussi.
+
+Aucun correctif du lanceur n'a été nécessaire pendant ce cycle. **Limite observée :
+le swap système est passé d'environ 1,8 à 5,5 Gio pendant l'installation, le
+téléchargement et le chargement.** Cet essai ne permet pas d'en attribuer la cause
+au seul modèle et ne valide pas une utilisation prolongée sans swap. Les contraintes
+de qualité des compactions restent celles décrites plus haut. L'état final du test
+est un setup supprimé ; le prochain `start` retéléchargera donc les poids.
 
 Pendant une session, pour vérifier l’identité du modèle :
 
